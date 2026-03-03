@@ -1,0 +1,429 @@
+import re
+import sys
+import argparse
+from pathlib import Path
+
+import pandas as pd
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.worksheet.table import Table, TableStyleInfo
+
+
+# =========================
+# Defaults (puedes cambiar para tu demo)
+# =========================
+DEFAULT_LETTER_ORDER = ["H", "A", "B", "C", "D", "E", "F", "G"]
+DEFAULT_BLOCK_THRESHOLD = 3  # blocklist si incidencias > 3
+
+
+# =========================
+# IO
+# =========================
+def load_file(file_path: str) -> pd.DataFrame:
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"No existe el archivo: {file_path}")
+
+    suffix = path.suffix.lower()
+
+    if suffix == ".csv":
+        # Mantener todo como texto para no perder códigos
+        try:
+            return pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            return pd.read_csv(path, dtype=str, keep_default_na=False, encoding="latin-1")
+
+    if suffix in [".xlsx", ".xls", ".xlsm"]:
+        return pd.read_excel(path, dtype=str).fillna("")
+
+    raise ValueError("Formato no soportado. Usa CSV o Excel.")
+
+
+# =========================
+# Helpers
+# =========================
+def canonical_col(col_name: str) -> str:
+    return (
+        str(col_name)
+        .strip()
+        .upper()
+        .replace(" ", "")
+        .replace("_", "")
+        .replace("-", "")
+    )
+
+
+def find_column(df: pd.DataFrame, aliases: list[str]) -> str:
+    alias_set = {canonical_col(a) for a in aliases}
+    for col in df.columns:
+        if canonical_col(col) in alias_set:
+            return col
+    raise ValueError(f"No se encontró ninguna de estas columnas: {aliases}")
+
+
+def parse_flat_id(flat_id: str):
+    """
+    Ejemplo:
+      1B-24 -> section=1, row='B', position=24
+    """
+    value = str(flat_id).strip().upper()
+    match = re.match(r"^(\d+)([A-Z])-(\d+)$", value)
+    if not match:
+        return 999, "ZZ", 9999
+    return int(match.group(1)), match.group(2), int(match.group(3))
+
+
+def build_letter_rank(letter_order: list[str]) -> dict:
+    return {letter: i for i, letter in enumerate(letter_order)}
+
+
+def row_rank(letter: str, letter_rank: dict) -> int:
+    if letter in letter_rank:
+        return letter_rank[letter]
+    if len(letter) == 1 and letter.isalpha():
+        return 100 + ord(letter)
+    return 999
+
+
+def match_error(series: pd.Series, value: str, mode: str) -> pd.Series:
+    """
+    mode:
+      - endswith: termina con value (default)
+      - equals: igualdad exacta
+      - contains: contiene value
+      - regex: value es un regex
+    """
+    s = series.astype(str).str.strip()
+
+    if mode == "endswith":
+        return s.str.endswith(value, na=False)
+    if mode == "equals":
+        return s.eq(value)
+    if mode == "contains":
+        return s.str.contains(re.escape(value), na=False)
+    if mode == "regex":
+        return s.str.contains(value, na=False, regex=True)
+
+    raise ValueError(f"match-mode inválido: {mode}")
+
+
+def safe_sheet_name(name: str) -> str:
+    # Excel: max 31 chars
+    name = re.sub(r"[\[\]\:\*\?\/\\]", "_", name)
+    return name[:31]
+
+
+# =========================
+# Metrics
+# =========================
+def compute_incidences(filtered_df: pd.DataFrame, block_threshold: int) -> tuple[pd.DataFrame, pd.DataFrame, set]:
+    total = len(filtered_df)
+    counts = filtered_df["FLAT_ID"].value_counts().reset_index()
+    counts.columns = ["FLAT_ID", "INCIDENCIAS"]
+    counts["PORCENTAJE"] = (counts["INCIDENCIAS"] / total * 100).round(2)
+
+    def priority(n: int) -> str:
+        if n > block_threshold:
+            return f"BLOQUEAR (>{block_threshold})"
+        if n == block_threshold:
+            return f"URGENTE (={block_threshold})"
+        if n == 2:
+            return "VIGILAR (=2)"
+        return "NORMAL (=1)"
+
+    counts["PRIORIDAD"] = counts["INCIDENCIAS"].astype(int).map(priority)
+
+    block_df = counts[counts["INCIDENCIAS"] > block_threshold].copy()
+    block_set = set(block_df["FLAT_ID"].tolist())
+    return counts, block_df, block_set
+
+
+# =========================
+# Styling
+# =========================
+def style_summary_sheet(ws):
+    header_fill = PatternFill("solid", fgColor="000000")
+    header_font = Font(color="FFFFFF", bold=True)
+    thin = Side(style="thin", color="808080")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = border
+
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+        for cell in row:
+            cell.border = border
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    ws.freeze_panes = "A2"
+
+
+def style_review_sheet(ws, block_set: set | None = None, duplicate_set: set | None = None):
+    """
+    - block_set: FLAT_ID con incidencias globales > threshold
+    - duplicate_set: FLAT_ID que era duplicado dentro de ESTA sección (ya se deduplicó)
+    Marca rojo si está en blocklist o si era duplicado en la sección.
+    """
+    header_fill = PatternFill("solid", fgColor="000000")
+    header_font = Font(color="FFFFFF", bold=True, size=11)
+
+    body_fill = PatternFill("solid", fgColor="D9D9D9")
+    hot_fill = PatternFill("solid", fgColor="FFC7CE")  # rojo claro
+    hot_font = Font(color="9C0006", bold=True)
+
+    thin = Side(style="thin", color="7F7F7F")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    block_set = block_set or set()
+    duplicate_set = duplicate_set or set()
+
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = border
+
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+        flat_cell = row[0]
+        flat_val = str(flat_cell.value).strip()
+        is_hot = (flat_val in block_set) or (flat_val in duplicate_set)
+
+        for idx, cell in enumerate(row, start=1):
+            cell.fill = body_fill
+            cell.border = border
+            if idx in [1, 2]:
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            else:
+                cell.alignment = Alignment(horizontal="center", vertical="top", wrap_text=True)
+
+        if is_hot:
+            flat_cell.fill = hot_fill
+            flat_cell.font = hot_font
+
+    widths = {"A": 12, "B": 30, "C": 40, "D": 52, "E": 52, "F": 42}
+    for col_letter, width in widths.items():
+        ws.column_dimensions[col_letter].width = width
+
+    for row_num in range(2, ws.max_row + 1):
+        ws.row_dimensions[row_num].height = 95
+    ws.row_dimensions[1].height = 24
+
+    ws.freeze_panes = "A2"
+
+    if ws.max_row >= 2:
+        ref = f"A1:F{ws.max_row}"
+        table_name = re.sub(r"[^A-Za-z0-9_]", "_", f"Tabla_{ws.title}")[:250]
+        tab = Table(displayName=table_name, ref=ref)
+        tab.tableStyleInfo = TableStyleInfo(
+            name="TableStyleLight1",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=False,
+            showColumnStripes=False,
+        )
+        ws.add_table(tab)
+
+
+# =========================
+# Build section sheet dataframe
+# =========================
+def build_review_df(section_unique: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame()
+    out["FLAT_ID"] = section_unique["FLAT_ID"]
+    out["ERROR_CODE"] = section_unique["ERROR_CODE"]
+    out["TOM_B-STATUS"] = ""
+    out["TOM_AL-STATUS"] = ""
+    out["TOM_AR-STATUS"] = ""
+    out["RAISER-STATUS"] = ""
+    return out
+
+
+# =========================
+# Core pipeline
+# =========================
+def prepare_filtered(df: pd.DataFrame, flat_col: str, error_col: str,
+                    error_value: str, match_mode: str,
+                    letter_rank: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+    full_df = df.copy()
+    full_df[flat_col] = full_df[flat_col].astype(str).str.strip()
+    full_df[error_col] = full_df[error_col].astype(str).str.strip()
+
+    mask = match_error(full_df[error_col], error_value, match_mode)
+    full_df = full_df[mask].copy()
+
+    parsed = full_df[flat_col].apply(parse_flat_id)
+    full_df["SECTION"] = parsed.apply(lambda x: x[0])
+    full_df["ROW_LETTER"] = parsed.apply(lambda x: x[1])
+    full_df["POSITION"] = parsed.apply(lambda x: x[2])
+    full_df["ROW_ORDER"] = full_df["ROW_LETTER"].apply(lambda x: row_rank(x, letter_rank))
+
+    full_df = full_df.sort_values(
+        by=["SECTION", "ROW_ORDER", "POSITION", flat_col],
+        ascending=[True, True, True, True]
+    ).reset_index(drop=True)
+
+    reduced = pd.DataFrame()
+    reduced["FLAT_ID"] = full_df[flat_col]
+    reduced["ERROR_CODE"] = full_df[error_col]
+    reduced["SECTION"] = full_df["SECTION"]
+    reduced["ROW_LETTER"] = full_df["ROW_LETTER"]
+    reduced["POSITION"] = full_df["POSITION"]
+    reduced["ROW_ORDER"] = full_df["ROW_ORDER"]
+
+    return reduced, full_df
+
+
+def export_outputs(filtered_df: pd.DataFrame, full_filtered_df: pd.DataFrame,
+                   output_xlsx: Path, block_threshold: int, error_tag: str):
+    output_xlsx.parent.mkdir(parents=True, exist_ok=True)
+
+    base = output_xlsx.with_suffix("")
+    output_csv_full = output_xlsx.with_suffix(".csv")
+    output_csv_incid = base.with_name(base.name + "_incidencias_flat_id").with_suffix(".csv")
+    output_csv_block = base.with_name(base.name + "_blocklist_flat_id").with_suffix(".csv")
+
+    # CSV completo: conserva todas columnas originales filtradas
+    full_filtered_df.to_csv(output_csv_full, index=False, encoding="utf-8-sig")
+
+    incid_df, block_df, block_set = compute_incidences(filtered_df, block_threshold)
+    incid_df.to_csv(output_csv_incid, index=False, encoding="utf-8-sig")
+    block_df.to_csv(output_csv_block, index=False, encoding="utf-8-sig")
+
+    # Hojas generales
+    detail_df = filtered_df[["SECTION", "FLAT_ID", "ERROR_CODE"]].copy()
+    summary_df = (
+        filtered_df.groupby("SECTION")
+        .size()
+        .reset_index(name=f"TOTAL_{error_tag}")
+        .sort_values("SECTION")
+    )
+
+    duplicate_map: dict[str, set] = {}
+
+    sheet_resumen = safe_sheet_name(f"Resumen_{error_tag}")
+    sheet_detalle = safe_sheet_name(f"Detalle_{error_tag}")
+    sheet_incid = safe_sheet_name("Incidencias_FLAT_ID")
+
+    with pd.ExcelWriter(output_xlsx, engine="openpyxl") as writer:
+        summary_df.to_excel(writer, sheet_name=sheet_resumen, index=False)
+        detail_df.to_excel(writer, sheet_name=sheet_detalle, index=False)
+        incid_df.to_excel(writer, sheet_name=sheet_incid, index=False)
+
+        for section in sorted(filtered_df["SECTION"].dropna().unique()):
+            section_data = filtered_df[filtered_df["SECTION"] == section].copy()
+
+            vc = section_data["FLAT_ID"].value_counts()
+            dup_set = set(vc[vc > 1].index.tolist())
+
+            # Dedupe por sección: 1 fila por FLAT_ID
+            section_unique = section_data.drop_duplicates(subset=["FLAT_ID"], keep="first").copy()
+
+            review_df = build_review_df(section_unique)
+            sheet_name = safe_sheet_name(f"Seccion_{section}")
+            review_df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+            duplicate_map[sheet_name] = dup_set
+
+        wb = writer.book
+        style_summary_sheet(wb[sheet_resumen])
+        style_summary_sheet(wb[sheet_detalle])
+        style_summary_sheet(wb[sheet_incid])
+
+        # Ajuste de anchos incidencias
+        ws_i = wb[sheet_incid]
+        ws_i.column_dimensions["A"].width = 12
+        ws_i.column_dimensions["B"].width = 16
+        ws_i.column_dimensions["C"].width = 16
+        ws_i.column_dimensions["D"].width = 20
+
+        for name in wb.sheetnames:
+            if name.startswith("Seccion_"):
+                style_review_sheet(
+                    wb[name],
+                    block_set=block_set,
+                    duplicate_set=duplicate_map.get(name, set()),
+                )
+
+    return output_xlsx, output_csv_full, output_csv_incid, output_csv_block
+
+
+# =========================
+# CLI
+# =========================
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Generate a section-based report from a raw CSV/Excel, filtering by Error Code."
+    )
+    p.add_argument("input_file", help="CSV/XLSX input file")
+    p.add_argument("output_xlsx", help="Output XLSX path (e.g., ./output/report.xlsx)")
+
+    p.add_argument("--error-value", default="665",
+                   help="Error code value/pattern to filter (default: 665)")
+    p.add_argument("--match-mode", choices=["endswith", "equals", "contains", "regex"],
+                   default="endswith",
+                   help="How to match error-value against the error column (default: endswith)")
+
+    p.add_argument("--block-threshold", type=int, default=DEFAULT_BLOCK_THRESHOLD,
+                   help="Blocklist threshold: block if incidences > N (default: 3)")
+
+    p.add_argument("--flat-col", default=None,
+                   help="Override FLAT_ID column name (optional)")
+    p.add_argument("--error-col", default=None,
+                   help="Override ERROR_CODE column name (optional)")
+
+    p.add_argument("--letter-order", default=",".join(DEFAULT_LETTER_ORDER),
+                   help='Comma-separated row letters order (default: "H,A,B,C,D,E,F,G")')
+
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    df = load_file(args.input_file)
+
+    # Column detection (or manual override)
+    flat_col = args.flat_col or find_column(df, ["FLAT_ID", "FLAT ID", "FLAT-ID"])
+    error_col = args.error_col or find_column(df, ["ERROR_CODE", "ERROR CODE", "ERROR-CODE"])
+
+    letter_order = [x.strip().upper() for x in args.letter_order.split(",") if x.strip()]
+    letter_rank = build_letter_rank(letter_order)
+
+    filtered_df, full_filtered_df = prepare_filtered(
+        df=df,
+        flat_col=flat_col,
+        error_col=error_col,
+        error_value=args.error_value,
+        match_mode=args.match_mode,
+        letter_rank=letter_rank,
+    )
+
+    if filtered_df.empty:
+        print(f"No se encontraron registros con {error_col} usando {args.match_mode}='{args.error_value}'.")
+        sys.exit(0)
+
+    # Tag usable in sheet names / headers (avoid long/illegal)
+    error_tag = re.sub(r"[^A-Za-z0-9]", "", str(args.error_value))[:10] or "ERR"
+
+    out_xlsx = Path(args.output_xlsx)
+    xlsx_path, csv_full, csv_incid, csv_block = export_outputs(
+        filtered_df=filtered_df,
+        full_filtered_df=full_filtered_df,
+        output_xlsx=out_xlsx,
+        block_threshold=args.block_threshold,
+        error_tag=error_tag,
+    )
+
+    print(f"Excel generado:              {xlsx_path}")
+    print(f"CSV completo (toda la data): {csv_full}")
+    print(f"CSV incidencias FLAT_ID:     {csv_incid}")
+    print(f"CSV blocklist FLAT_ID:       {csv_block}")
+    print(f"Total registros filtrados:   {len(filtered_df)}")
+    print(f"Filtro: {error_col} {args.match_mode} '{args.error_value}'")
+    print(f"Regla blocklist: incidencias > {args.block_threshold}")
+
+
+if __name__ == "__main__":
+    main()
